@@ -94,6 +94,8 @@ enum {
 	STAT_CLI_O_RESOLVERS,/* dump a resolver's section nameservers counters */
 	STAT_CLI_O_SERVERS_STATE, /* dump server state and changing information */
 	STAT_CLI_O_BACKEND,  /* dump backend list */
+	STAT_CLI_O_SERVER_ADD, /* add a server to a backend */
+	STAT_CLI_O_SERVER_REMOVE, /* remove a server from a backend */
 };
 
 /* Actions available for the stats admin forms */
@@ -2286,8 +2288,80 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			appctx->st0 = STAT_CLI_PROMPT;
 			return 1;
 		}
+		else if (strcmp(args[1], "server") == 0) {
+			/* Delete a server from a backend.
+			 * Format: del server BACKEND SERVER
+			 */
+			struct proxy * backend = NULL;
+			struct server * server = NULL;
+			struct server * current;
+
+			if (!*args[2] || !*args[3]) {
+				appctx->ctx.cli.msg = "Bad number of arguments for del server.";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
+			if (!get_backend_server(args[2], args[3], &backend, &server)) {
+				char * msg;
+
+				if (!backend) {
+					msg = "No such backend.";
+				}
+				else if (!server) {
+					msg = "No such server.";
+				}
+				else {
+					msg = "Unexpected error in calling get_backend_server.";
+				}
+				
+				appctx->ctx.cli.msg = msg;
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
+			/* Ensure the server is maintenance mode. */
+			if ((server->admin & SRV_ADMF_MAINT) == 0) {
+				appctx->ctx.cli.msg = "Only servers in maintenance mode may be removed.";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
+			/* Ensure that the server's state is stopped. */
+			if (server->state != SRV_ST_STOPPED) {
+				appctx->ctx.cli.msg = "Only servers that are completely stopped may be removed.";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
+			/* Scan the list of servers in this backend until the previous server is reached. */
+			current = backend->srv;
+			while (current->next != server) {
+				current = current->next;
+			}
+
+			if (current) {
+				current->next = current->next->next;
+			}
+			else {
+				appctx->ctx.cli.msg = "Unable to remove server because of linked list fun.";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
+			if (server->flags & SRV_F_BACKUP)
+				backend->srv_bck--;
+			else
+				backend->srv_act--;
+
+			free(server);
+
+			appctx->ctx.cli.msg = "Server removed.";
+			appctx->st0 = STAT_CLI_PRINT;
+			return 1;
+		}
 		else { /* unknown "del" parameter */
-			appctx->ctx.cli.msg = "'del' only supports 'map' or 'acl'.\n";
+			appctx->ctx.cli.msg = "'del' only supports 'map', 'acl', or 'server'.\n";
 			appctx->st0 = STAT_CLI_PRINT;
 			return 1;
 		}
@@ -2362,8 +2436,46 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			appctx->st0 = STAT_CLI_PROMPT;
 			return 1;
 		}
-		else { /* unknown "del" parameter */
-			appctx->ctx.cli.msg = "'add' only supports 'map'.\n";
+		else if (strcmp(args[1], "server") == 0) {
+			/* Add a server to a backend.
+			 * Format: add server BACKEND SERVER_ID PARAMETERS ...
+			 */
+			struct proxy *backend;
+			int err_code;
+			extern struct proxy defproxy;
+
+			backend = proxy_be_by_name(args[2]);
+			if (!backend) {
+				appctx->ctx.cli.msg = "No such backend.";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
+			/* Remove the backend name from the args array to trick parse_server
+			 * into thinking that it is being called from configuration parser.
+			 */
+			for (i = 2; i < MAX_STATS_ARGS - 1; i++) {
+				args[i] = args[i + 1];
+			}
+
+			err_code = parse_server("stats-socket", 1, args + 1, backend, &defproxy);
+			if ((err_code & (ERR_FATAL | ERR_ABORT)) != 0) {
+				appctx->ctx.cli.msg = "Error duing add server. See log for details.";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+			else {
+				struct server *srv = backend->srv;
+
+				server_recalc_eweight(srv);
+
+				appctx->ctx.cli.msg = "Server added.";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+		}
+		else { /* unknown "add" parameter */
+			appctx->ctx.cli.msg = "'add' only supports 'map' or 'server'.\n";
 			appctx->st0 = STAT_CLI_PRINT;
 			return 1;
 		}
